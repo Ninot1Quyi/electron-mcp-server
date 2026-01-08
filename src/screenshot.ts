@@ -189,45 +189,96 @@ export async function takeScreenshot(
       }
     }
 
+    // Get browser-level WebSocket URL for CDP connection
+    // We need to connect to the browser, not individual pages
+    let browserWsUrl: string | null = null;
+    try {
+      // Fetch browser WebSocket URL from /json/version endpoint
+      const response = await fetch(`http://localhost:${targetApp.port}/json/version`);
+      if (response.ok) {
+        const versionInfo = await response.json();
+        browserWsUrl = versionInfo.webSocketDebuggerUrl;
+        logger.info(`Got browser WebSocket URL: ${browserWsUrl}`);
+      }
+    } catch (e) {
+      logger.info(`Could not fetch browser WebSocket URL: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
     // Connect to the Electron app's debugging port
-    const browser = await chromium.connectOverCDP(`http://localhost:${targetApp.port}`);
-    const contexts = browser.contexts();
+    let browser;
+    let targetPage = null;
 
-    if (contexts.length === 0) {
-      throw new Error(
-        'No browser contexts found - make sure Electron app is running with remote debugging enabled',
-      );
-    }
-
-    const context = contexts[0];
-    const pages = context.pages();
-
-    if (pages.length === 0) {
-      throw new Error('No pages found in the browser context');
-    }
-
-    // Find the main application page (skip DevTools pages)
-    let targetPage = pages[0];
-    for (const page of pages) {
-      const url = page.url();
-      const title = await page.title().catch(() => '');
-
-      // Skip DevTools and about:blank pages
-      if (
-        !url.includes('devtools://') &&
-        !url.includes('about:blank') &&
-        title &&
-        !title.includes('DevTools')
-      ) {
-        // If windowTitle is specified, try to match it
-        if (windowTitle && title.toLowerCase().includes(windowTitle.toLowerCase())) {
-          targetPage = page;
-          break;
-        } else if (!windowTitle) {
-          targetPage = page;
-          break;
+    if (browserWsUrl) {
+      // Connect to browser-level WebSocket
+      logger.info(`Connecting via browser WebSocket: ${browserWsUrl}`);
+      browser = await chromium.connectOverCDP(browserWsUrl);
+      const contexts = browser.contexts();
+      if (contexts.length > 0) {
+        const context = contexts[0];
+        const pages = context.pages();
+        if (pages.length > 0) {
+          targetPage = pages[0];
+          // Find the main application page (skip DevTools pages)
+          for (const page of pages) {
+            const url = page.url();
+            const title = await page.title().catch(() => '');
+            if (
+              !url.includes('devtools://') &&
+              !url.includes('about:blank') &&
+              title &&
+              !title.includes('DevTools')
+            ) {
+              if (windowTitle && title.toLowerCase().includes(windowTitle.toLowerCase())) {
+                targetPage = page;
+                break;
+              } else if (!windowTitle) {
+                targetPage = page;
+                break;
+              }
+            }
+          }
         }
       }
+    }
+
+    // Fallback: connect directly to page WebSocket URL
+    if (!targetPage) {
+      // Get page WebSocket URL from targets
+      let pageWebSocketUrl: string | null = null;
+      if (targetApp.targets && targetApp.targets.length > 0) {
+        const pageTarget = targetApp.targets.find(
+          (t: { type: string; webSocketDebuggerUrl?: string }) =>
+            t.type === 'page' && t.webSocketDebuggerUrl
+        );
+        if (pageTarget) {
+          pageWebSocketUrl = pageTarget.webSocketDebuggerUrl || null;
+        }
+      }
+
+      if (pageWebSocketUrl) {
+        logger.info(`Connecting directly to page WebSocket: ${pageWebSocketUrl}`);
+        browser = await chromium.connectOverCDP(pageWebSocketUrl);
+        // When connecting to a page directly, the page is available via browser.contexts()
+        const contexts = browser.contexts();
+        if (contexts.length > 0) {
+          const pages = contexts[0].pages();
+          if (pages.length > 0) {
+            targetPage = pages[0];
+          }
+        }
+        // If still no page, try to get it from default context
+        if (!targetPage) {
+          const defaultContext = browser.contexts()[0] || (await browser.newContext());
+          const pages = defaultContext.pages();
+          targetPage = pages[0];
+        }
+      }
+    }
+
+    if (!targetPage) {
+      throw new Error(
+        'No pages found - make sure Electron app is running with remote debugging enabled',
+      );
     }
 
     logger.info(`Taking screenshot of page: ${targetPage.url()} (${await targetPage.title()})`);
